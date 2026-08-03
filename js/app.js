@@ -7,7 +7,7 @@ const formError = document.getElementById("form-error");
 const fxBadge = document.getElementById("fx-badge");
 const copyBtn = document.getElementById("copy-btn");
 
-const STORAGE_KEY = "carImportCalculator.v1";
+const STORAGE_KEY = "carImportCalculator.v2";
 
 const fmt = (n) => "€" + Number(n).toLocaleString("en-IE", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const fmt0 = (n) => "€" + Number(n).toLocaleString("en-IE", { minimumFractionDigits: 0, maximumFractionDigits: 0 });
@@ -63,6 +63,16 @@ function refreshHints() {
   const buyer = document.querySelector('input[name="buyerType"]:checked').value;
   document.getElementById("origin-hint").textContent = ORIGIN_HINTS[origin];
   document.getElementById("buyer-hint").textContent = BUYER_HINTS[buyer];
+  updateKbNote();
+}
+
+/** Show the "auto-detected from knowledge base" confirmation only when CO₂ was
+ *  actually filled by the KB for the current car (critique-12). */
+function updateKbNote() {
+  const el = document.getElementById("co2-kb-note");
+  if (!el) return;
+  const co2El = document.getElementById("co2");
+  el.classList.toggle("hidden", !(autoApplied.has("co2") && co2El && co2El.value !== ""));
 }
 form.addEventListener("change", refreshHints);
 
@@ -79,9 +89,11 @@ function clearError() {
 
 /* ── Persistence (pass-08) ───────────────────────────────────────── */
 function persist() {
-  const keys = ["make", "model", "year", "uk-price", "co2", "nox", "shipping", "fuel-type", "co2-standard"];
+  const keys = ["year", "uk-price", "co2", "nox", "shipping", "fuel-type", "co2-standard"];
   const state = {};
   keys.forEach((k) => (state[k] = document.getElementById(k).value));
+  state.make = readFieldValue("make");
+  state.model = readFieldValue("model");
   state.origin = document.querySelector('input[name="origin"]:checked').value;
   state.buyerType = document.querySelector('input[name="buyerType"]:checked').value;
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch {}
@@ -90,11 +102,20 @@ function restore() {
   let state;
   try { state = JSON.parse(localStorage.getItem(STORAGE_KEY)); } catch { return; }
   if (!state) return;
-  const keys = ["make", "model", "year", "uk-price", "co2", "nox", "shipping", "fuel-type", "co2-standard"];
+  if (state.make) {
+    setFieldValue("make", state.make);
+    populateModels();
+  }
+  if (state.model) setFieldValue("model", state.model);
+  const keys = ["year", "uk-price", "co2", "nox", "shipping", "fuel-type", "co2-standard"];
   keys.forEach((k) => {
     const el = document.getElementById(k);
     if (state[k] != null && state[k] !== "") el.value = state[k];
   });
+  const mo = document.getElementById("make-other");
+  if (mo) mo.classList.toggle("hidden", document.getElementById("make").value !== "__other__");
+  const so = document.getElementById("model-other");
+  if (so) so.classList.toggle("hidden", document.getElementById("model").value !== "__other__");
   if (state.origin) {
     const o = document.querySelector(`input[name="origin"][value="${state.origin}"]`);
     if (o) o.checked = true;
@@ -103,6 +124,297 @@ function restore() {
     const b = document.querySelector(`input[name="buyerType"][value="${state.buyerType}"]`);
     if (b) b.checked = true;
   }
+  applyKnownSpecs();
+}
+
+/* ── Car knowledge base + smart selectors (pass-21) ─────────────── */
+const CURRENT_YEAR = new Date().getFullYear();
+
+function otherInputId(id) {
+  return id === "make" ? "make-other" : id === "model" ? "model-other" : null;
+}
+
+/** Read a field's value, falling back to its "Other" free-text input when a select is set to "__other__". */
+function readFieldValue(id) {
+  const el = document.getElementById(id);
+  if (!el) return "";
+  const v = el.value;
+  const otherId = otherInputId(id);
+  if (v === "__other__" && otherId) {
+    const other = document.getElementById(otherId);
+    return other ? other.value.trim() : "";
+  }
+  return String(v).trim();
+}
+
+/** Set a field's value. For make/model selects, picks the matching option or falls
+ *  back to the "Other" free-text input when the value isn't a known option. */
+function setFieldValue(id, value) {
+  if (value == null || value === "") return;
+  const el = document.getElementById(id);
+  if (!el) return;
+  const v = String(value);
+  const otherId = otherInputId(id);
+  if (el.tagName === "SELECT") {
+    const opts = Array.from(el.options).map((o) => o.value);
+    if (opts.includes(v)) {
+      el.value = v;
+    } else if (otherId) {
+      el.value = "__other__";
+      const other = document.getElementById(otherId);
+      if (other) other.value = v;
+    } else {
+      return; // year outside the offered range — ignore
+    }
+  } else {
+    el.value = v;
+  }
+  flashField(el);
+}
+
+function flashField(el) {
+  el.classList.remove("flash");
+  void el.offsetWidth; // restart animation
+  el.classList.add("flash");
+}
+
+function populateMakes() {
+  const sel = document.getElementById("make");
+  if (!sel) return;
+  sel.innerHTML = '<option value="" selected>Select make…</option>';
+  (window.CarSpecs ? window.CarSpecs.MAKES : []).forEach((m) => {
+    const o = document.createElement("option");
+    o.value = m;
+    o.textContent = m;
+    sel.appendChild(o);
+  });
+  const other = document.createElement("option");
+  other.value = "__other__";
+  other.textContent = "Other…";
+  sel.appendChild(other);
+}
+
+function populateModels() {
+  const sel = document.getElementById("model");
+  if (!sel) return;
+  const make = readFieldValue("make");
+  sel.innerHTML = "";
+  if (!make) {
+    const ph = document.createElement("option");
+    ph.value = "";
+    ph.textContent = "Select make first…";
+    sel.appendChild(ph);
+    sel.disabled = true;
+    return;
+  }
+  const models = window.CarSpecs ? window.CarSpecs.modelsFor(make) : [];
+  const ph = document.createElement("option");
+  ph.value = "";
+  ph.textContent = "Select model…";
+  sel.appendChild(ph);
+  models.forEach((m) => {
+    const o = document.createElement("option");
+    o.value = m;
+    o.textContent = m;
+    sel.appendChild(o);
+  });
+  const other = document.createElement("option");
+  other.value = "__other__";
+  other.textContent = "Other…";
+  sel.appendChild(other);
+  sel.disabled = false;
+}
+
+function populateYears() {
+  const sel = document.getElementById("year");
+  if (!sel) return;
+  sel.innerHTML = '<option value="" selected>Select year…</option>';
+  for (let y = CURRENT_YEAR + 1; y >= 1990; y--) {
+    const o = document.createElement("option");
+    o.value = String(y);
+    o.textContent = String(y);
+    sel.appendChild(o);
+  }
+}
+
+/* Fields the knowledge base may auto-fill — skipped once the user edits them. */
+const userTouched = new Set();
+/* Fields previously auto-filled from the knowledge base. Cleared when the
+   car's make/model/year changes so stale figures never linger (critique-1). */
+const autoApplied = new Set();
+["co2", "nox", "fuel-type", "co2-standard"].forEach((id) => {
+  const el = document.getElementById(id);
+  if (el) {
+    const mark = () => {
+      // An empty value ("Auto-detect" fuel / cleared field) must not block KB fills.
+      if (el.value === "") userTouched.delete(id);
+      else userTouched.add(id);
+      autoApplied.delete(id);
+    };
+    el.addEventListener("input", mark);
+    el.addEventListener("change", mark);
+  }
+});
+
+/* Set when a partial extraction still needs user input (e.g. the asking
+   price). The first form change that completes the data auto-calculates. */
+let pendingPartialCalc = false;
+
+/** Drop values the knowledge base auto-filled so a changed car never keeps
+ *  the previous car's CO₂/fuel/NOx. Never touches fields the user typed. */
+function clearAutoApplied() {
+  if (autoApplied.size === 0) return;
+  const reset = { co2: "", "fuel-type": "", nox: "", "co2-standard": "wltp" };
+  autoApplied.forEach((id) => {
+    if (reset[id] !== undefined && !userTouched.has(id)) {
+      const el = document.getElementById(id);
+      if (el) el.value = reset[id];
+    }
+  });
+  autoApplied.clear();
+  updateKbNote();
+}
+
+/** Reset every spec field (CO₂, fuel, NOx, standard) and forget both which
+ *  ones the KB applied and which the user touched. Used when the car changes
+ *  (a different make) or a fresh listing is extracted, so the previous car's
+ *  figures never leak into the next one. */
+function resetSpecFields() {
+  const reset = { co2: "", "fuel-type": "", nox: "", "co2-standard": "wltp" };
+  Object.keys(reset).forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.value = reset[id];
+    userTouched.delete(id);
+  });
+  autoApplied.clear();
+  updateKbNote();
+}
+
+/**
+ * Auto-fill CO₂, fuel type, CO₂ standard and NOx from the car-specs knowledge
+ * base when make/model/year are known. Skips fields the user has touched.
+ * Returns true when anything was applied.
+ */
+function applyKnownSpecs() {
+  if (!window.CarSpecs) return false;
+  let make = readFieldValue("make");
+  let model = readFieldValue("model");
+  const year = Number(document.getElementById("year").value) || 0;
+  if (!make || !model || !year) return false;
+  let spec = window.CarSpecs.lookup(make, model, year);
+  // Free-text "Other" entries can still match a known car — canonicalise them
+  // so the KB fills CO₂/fuel/NOx even for typed makes/models (critique-11).
+  if (!spec && canonicalizeMakeModel()) {
+    make = readFieldValue("make");
+    model = readFieldValue("model");
+    spec = window.CarSpecs.lookup(make, model, year);
+  }
+  if (!spec) return false;
+
+  let applied = false;
+
+  const co2El = document.getElementById("co2");
+  if (!userTouched.has("co2") && spec.co2 != null && co2El && co2El.value === "") {
+    setFieldValue("co2", spec.co2);
+    autoApplied.add("co2");
+    applied = true;
+  }
+
+  const fuelEl = document.getElementById("fuel-type");
+  if (!userTouched.has("fuel-type") && spec.fuelType && fuelEl && fuelEl.value === "") {
+    fuelEl.value = spec.fuelType;
+    flashField(fuelEl);
+    autoApplied.add("fuel-type");
+    applied = true;
+  }
+
+  const stdEl = document.getElementById("co2-standard");
+  if (!userTouched.has("co2-standard") && spec.co2Standard && stdEl && stdEl.value !== spec.co2Standard) {
+    stdEl.value = spec.co2Standard;
+    flashField(stdEl);
+    autoApplied.add("co2-standard");
+    applied = true;
+  }
+
+  const noxEl = document.getElementById("nox");
+  if (!userTouched.has("nox") && spec.nox != null && noxEl && noxEl.value === "") {
+    setFieldValue("nox", spec.nox);
+    autoApplied.add("nox");
+    applied = true;
+  }
+
+  if (applied) {
+    refreshHints();
+    persist();
+  }
+  markSpecMatchingFields();
+  return applied;
+}
+
+/** After restoring saved state, tag any field that still matches the knowledge
+ *  base as auto-applied, so changing the car re-derives it later. */
+function markSpecMatchingFields() {
+  if (!window.CarSpecs) return;
+  const make = readFieldValue("make");
+  const model = readFieldValue("model");
+  const year = Number(document.getElementById("year").value) || 0;
+  if (!make || !model || !year) return;
+  const spec = window.CarSpecs.lookup(make, model, year);
+  if (!spec) return;
+  const match = (id, v) => {
+    if (v == null) return false;
+    const el = document.getElementById(id);
+    return !!el && String(el.value) === String(v);
+  };
+  if (match("co2", spec.co2)) autoApplied.add("co2");
+  if (match("fuel-type", spec.fuelType)) autoApplied.add("fuel-type");
+  if (match("nox", spec.nox)) autoApplied.add("nox");
+  if (match("co2-standard", spec.co2Standard)) autoApplied.add("co2-standard");
+  updateKbNote();
+}
+
+/** Resolve a free-text "Other" make/model to a canonical knowledge-base entry
+ *  (e.g. "Porsche" + "Taycan Turbo" → Porsche · Taycan). Returns true when the
+ *  selects were re-pointed to real options so KB lookups succeed. */
+function canonicalizeMakeModel() {
+  if (!window.CarSpecs) return false;
+  const rawMake = readFieldValue("make");
+  const rawModel = readFieldValue("model");
+  if (!rawMake || !rawModel) return false;
+  const mk = window.CarSpecs.matchMake(rawMake);
+  if (!mk) return false;
+  const md = window.CarSpecs.matchModel(mk, rawModel);
+  if (!md) return false;
+  if (mk === rawMake && md === rawModel) return false;
+  setFieldValue("make", mk);
+  populateModels();
+  setFieldValue("model", md);
+  // Real options now exist — hide the "Other" free-text inputs.
+  const mo = document.getElementById("make-other");
+  if (mo) mo.classList.add("hidden");
+  const so = document.getElementById("model-other");
+  if (so) so.classList.add("hidden");
+  return true;
+}
+
+function onMakeChange() {
+  pendingPartialCalc = false; // user is switching cars — a partial extract's auto-calc no longer applies
+  const other = document.getElementById("make-other");
+  if (other) other.classList.toggle("hidden", document.getElementById("make").value !== "__other__");
+  populateModels();
+  document.getElementById("model").value = "";
+  const so = document.getElementById("model-other");
+  if (so) { so.value = ""; so.classList.add("hidden"); }
+  // A different make means a different car — drop the previous car's figures.
+  resetSpecFields();
+  applyKnownSpecs();
+}
+function onModelChange() {
+  pendingPartialCalc = false;
+  const other = document.getElementById("model-other");
+  if (other) other.classList.toggle("hidden", document.getElementById("model").value !== "__other__");
+  clearAutoApplied();
+  applyKnownSpecs();
 }
 
 /* ── Submit ──────────────────────────────────────────────────────── */
@@ -110,8 +422,8 @@ function buildPayload() {
   const origin = document.querySelector('input[name="origin"]:checked').value;
   const buyerType = document.querySelector('input[name="buyerType"]:checked').value;
   return {
-    make: document.getElementById("make").value.trim(),
-    model: document.getElementById("model").value.trim(),
+    make: readFieldValue("make"),
+    model: readFieldValue("model"),
     firstRegYear: Number(document.getElementById("year").value),
     ukPriceGBP: Number(document.getElementById("uk-price").value),
     co2: Number(document.getElementById("co2").value),
@@ -127,25 +439,39 @@ function buildPayload() {
 
 function validate() {
   const y = Number(document.getElementById("year").value);
-  if (!y || y < 1990 || y > 2026) return "Please enter a valid year of first registration (1990–2026).";
+  if (!y || y < 1990 || y > CURRENT_YEAR + 1) return { msg: `Please select a valid year of first registration (1990–${CURRENT_YEAR + 1}).`, focusId: "year" };
   const p = Number(document.getElementById("uk-price").value);
-  if (!p || p <= 0) return "Please enter a valid UK purchase price in £.";
+  if (!p || p <= 0) return { msg: "Please enter a valid UK purchase price in £.", focusId: "uk-price" };
   const c = document.getElementById("co2").value;
-  const fuel = document.getElementById("fuel-type").value;
+  let fuel = document.getElementById("fuel-type").value;
+  // Try the knowledge base first: make/model/year may already auto-fill CO₂
+  // (and fuel type when it's still on "Auto-detect").
+  if ((c === "" || fuel === "") && fuel !== "electric") applyKnownSpecs();
+  const c2 = document.getElementById("co2").value;
+  fuel = document.getElementById("fuel-type").value;
   // EVs emit 0 g/km — a blank or 0 CO₂ is valid and needs no figure from the V5C.
   if (fuel === "electric") {
-    if (c === "") document.getElementById("co2").value = "0";
+    if (c2 === "") document.getElementById("co2").value = "0";
     return null;
   }
-  if (c === "" || Number(c) < 0 || Number.isNaN(Number(c))) return "Please enter the CO₂ figure (g/km) from the V5C.";
+  if (c2 === "" || Number(c2) < 0 || Number.isNaN(Number(c2))) return { msg: "Please enter the CO₂ figure (g/km) from the V5C.", focusId: "co2" };
   return null;
 }
 
 async function submit(e) {
   e.preventDefault();
   clearError();
+  pendingPartialCalc = false;
   const err = validate();
-  if (err) { showError(err); return; }
+  if (err) {
+    showError(err.msg);
+    const focusEl = err.focusId ? document.getElementById(err.focusId) : null;
+    if (focusEl) {
+      focusEl.focus();
+      focusEl.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+    return;
+  }
 
   submitBtn.disabled = true;
   submitBtn.classList.add("loading");
@@ -426,19 +752,30 @@ function extractHintMsg(msg) {
 
 function fillFromListing(r) {
   const setVal = (id, v) => {
+    if (v == null || v === "") return;
     const el = document.getElementById(id);
-    if (el && v != null && v !== "") {
-      el.value = v;
-      el.classList.remove("flash");
-      void el.offsetWidth; // restart animation
-      el.classList.add("flash");
-    }
+    if (!el) return;
+    setFieldValue(id, String(v));
   };
   const notes = [];
 
-  if (r.make) setVal("make", r.make);
-  if (r.model) setVal("model", r.model);
+  if (r.make) {
+    const canonMake = window.CarSpecs && window.CarSpecs.matchMake ? window.CarSpecs.matchMake(r.make) : null;
+    const make = canonMake || r.make;
+    setFieldValue("make", make);
+    populateModels();
+    if (r.model) {
+      const canonModel = window.CarSpecs && window.CarSpecs.matchModel ? window.CarSpecs.matchModel(make, r.model) : null;
+      setFieldValue("model", canonModel || r.model);
+    }
+  } else if (r.model) {
+    setFieldValue("model", r.model);
+  }
   if (r.year) setVal("year", String(r.year));
+  const mo = document.getElementById("make-other");
+  if (mo) mo.classList.toggle("hidden", document.getElementById("make").value !== "__other__");
+  const so = document.getElementById("model-other");
+  if (so) so.classList.toggle("hidden", document.getElementById("model").value !== "__other__");
 
   // Price: prefer GBP; convert EUR → GBP using the live rate.
   let priceGBP = r.priceGBP;
@@ -476,6 +813,10 @@ function fillFromListing(r) {
     }
   }
 
+  // Fill any remaining gaps (CO₂/fuel/NOx) from the knowledge base now that
+  // make/model/year are known — even on partial extracts.
+  applyKnownSpecs();
+
   refreshHints();
   persist();
   return notes;
@@ -489,13 +830,28 @@ function autoCalculateIfReady() {
   // CO₂ is "present" when non-zero, OR when the car is an EV (0 g/km is valid).
   const fuel = document.getElementById("fuel-type").value;
   const co2 = document.getElementById("co2").value;
-  const co2Ok = fuel === "electric" ? co2 !== "" : co2 !== "" && Number(co2) > 0;
+  const co2Ok = fuel === "electric" ? true : co2 !== "" && Number(co2) > 0;
   if (has("year") && has("uk-price") && co2Ok) {
     form.requestSubmit();
     return true;
   }
   return false;
 }
+
+/* After a partial extract, calculate as soon as the missing detail is
+   filled in — one less click, and the result stays up to date. */
+form.addEventListener("change", () => {
+  if (!pendingPartialCalc) return;
+  pendingPartialCalc = false;
+  if (autoCalculateIfReady()) {
+    if (extractedChip.className.includes("partial")) {
+      setChip("ok", "Details complete — calculating…");
+      extractHintMsg("");
+    }
+  } else {
+    pendingPartialCalc = true;
+  }
+});
 
 async function extractFromUrl() {
   const url = listingUrl.value.trim();
@@ -585,23 +941,38 @@ async function extractFromUrl() {
     // URL-only results are partial: fill what we have, then ask for the price.
     const result = extracted || urlOnly;
     const isUrlOnly = !!urlOnly;
+    pendingPartialCalc = false;
+    resetSpecFields();
     const notes = fillFromListing(result) || [];
 
     if (isUrlOnly) {
       const parts = [result.make, result.model, result.year].filter(Boolean).join(" · ");
+      // CO₂ may have been auto-filled from the knowledge base after fillFromListing.
+      const co2El = document.getElementById("co2");
+      const co2Known = co2El.value !== "";
       const ask = [];
       if (!result.priceGBP) ask.push("the asking price");
-      if (result.co2 == null && result.fuelType !== "electric") ask.push("CO₂");
+      if (!co2Known) ask.push("CO₂");
       const hint = ask.length
         ? `We read this from the link — please add ${ask.join(" and ")} from the advert.`
         : "We read this from the link — please double-check the details above.";
-      setChip("partial", `Read from link: ${parts}. Please add ${ask.length ? ask.join(" and ") : "the price"} and press Calculate.`);
-      extractHintMsg(hint);
-      const focusId = ask.includes("CO₂") ? "co2" : "price";
-      const el = document.getElementById(focusId);
-      if (el) {
-        el.focus();
-        el.scrollIntoView({ behavior: "smooth", block: "center" });
+      if (ask.length) {
+        setChip("partial", `Read from link: ${parts}. Please add ${ask.join(" and ")} and press Calculate.`);
+        extractHintMsg(hint);
+        pendingPartialCalc = true;
+        const focusId = ask.includes("CO₂") ? "co2" : "uk-price";
+        const el = document.getElementById(focusId);
+        if (el) {
+          el.focus();
+          el.scrollIntoView({ behavior: "smooth", block: "center" });
+        }
+      } else {
+        // Every key detail is present (price from the link, CO₂ from the KB) — calculate automatically.
+        setChip("ok", `Read from link: ${parts}.`);
+        extractHintMsg(hint);
+        if (!autoCalculateIfReady()) {
+          extractHintMsg("All key details were read from the link — double-check them, then press Calculate.");
+        }
       }
       return;
     }
@@ -609,21 +980,30 @@ async function extractFromUrl() {
     const parts = [result.make, result.model, result.year, `£${Math.round(result.priceGBP)}`]
       .filter(Boolean).join(" · ");
     const missing = [];
+    // CO₂ may now be auto-filled from the knowledge base.
+    const co2El2 = document.getElementById("co2");
+    const co2Known2 = co2El2.value !== "";
     // EVs emit 0 g/km — co2=0 (or null with fuelType electric) means no figure needed.
-    if (result.co2 == null && result.fuelType !== "electric") missing.push("CO₂");
+    if (!co2Known2) missing.push("CO₂");
     if (!result.origin) missing.push("origin");
 
     if (missing.length) {
       setChip("partial", `Extracted: ${parts}. Please add: ${missing.join(", ")}.`);
+      pendingPartialCalc = true;
       if (missing.includes("CO₂")) {
-        extractHintMsg("CO₂ is needed for VRT — it's on the UK V5C or the advert's spec. Add it and press Calculate.");
+        extractHintMsg("CO₂ is needed for VRT — it's on the UK V5C or the advert's spec. NOx is optional: Revenue applies a default rate if left blank. Add CO₂ and press Calculate.");
       } else {
         extractHintMsg("Where the car is registered changes duty & VAT by thousands — please select Great Britain or Northern Ireland.");
       }
       // Take the user to the first thing they must fix, not the (empty) results.
-      const focusId = missing[0] === "CO₂" ? "co2" : null;
-      if (focusId) {
-        const el = document.getElementById(focusId);
+      if (missing[0] === "CO₂") {
+        const el = document.getElementById("co2");
+        if (el) {
+          el.focus();
+          el.scrollIntoView({ behavior: "smooth", block: "center" });
+        }
+      } else if (missing[0] === "origin") {
+        const el = document.querySelector('#origin-group input[type="radio"]');
         if (el) {
           el.focus();
           el.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -659,15 +1039,69 @@ listingUrl.addEventListener("keydown", (e) => {
     extractFromUrl();
   }
 });
-// If the user changes the pasted link, clear the stale extraction result.
+
+const clearUrlBtn = document.getElementById("clear-url");
+function syncClearBtn() {
+  if (clearUrlBtn) clearUrlBtn.classList.toggle("hidden", listingUrl.value === "");
+}
 listingUrl.addEventListener("input", () => {
+  pendingPartialCalc = false;
+  syncClearBtn();
   const cls = extractedChip.className;
   if (cls.includes("ok") || cls.includes("partial")) {
     setChip("", "");
     extractHintMsg("");
   }
 });
+if (clearUrlBtn) {
+  clearUrlBtn.addEventListener("click", () => {
+    listingUrl.value = "";
+    pendingPartialCalc = false;
+    syncClearBtn();
+    setChip("", "");
+    extractHintMsg("");
+    listingUrl.focus();
+  });
+}
+syncClearBtn();
 
 refreshHints();
-restore();
 loadFx();
+
+/* ── Smart selector wiring (pass-21) ────────────────────────────── */
+const makeEl = document.getElementById("make");
+const modelEl = document.getElementById("model");
+const yearEl = document.getElementById("year");
+const makeOtherEl = document.getElementById("make-other");
+const modelOtherEl = document.getElementById("model-other");
+
+// Populate the selects BEFORE restoring saved state so known values map to
+// real options instead of falling into the "Other" free-text inputs.
+populateMakes();
+populateYears();
+if (!readFieldValue("make")) populateModels(); // leaves model select disabled
+
+restore();
+
+makeEl.addEventListener("change", onMakeChange);
+modelEl.addEventListener("change", onModelChange);
+// Changing the car (make/model/year) drops any KB-auto-filled figures first
+// so a different car never keeps the old car's CO₂/fuel/NOx (critique-1).
+yearEl.addEventListener("change", () => { pendingPartialCalc = false; clearAutoApplied(); applyKnownSpecs(); });
+if (makeOtherEl) {
+  makeOtherEl.addEventListener("input", () => {
+    pendingPartialCalc = false;
+    populateModels();
+    resetSpecFields();
+    applyKnownSpecs();
+  });
+}
+if (modelOtherEl) {
+  modelOtherEl.addEventListener("input", () => { pendingPartialCalc = false; clearAutoApplied(); applyKnownSpecs(); });
+}
+
+// Click-to-select the pasted URL so pasting replaces it in one step (pass-21).
+const listingUrlEl = document.getElementById("listing-url");
+if (listingUrlEl) {
+  listingUrlEl.addEventListener("focus", () => listingUrlEl.select());
+}
